@@ -1,0 +1,72 @@
+# Python bytecode, test caches, and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+*.tmp
+
+# Python build and packaging output
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+
+# Optional local Codex marketplace metadata for this single-plugin repository
+.agents/
+.codex/
+
+# Internal implementation notes are not part of the distributable plugin
+docs/superpowers/
+tests/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local.json
+*.local.yaml
+*.local.yml
+*.local.toml
+*.secret
+*.pem
+*.key
+*.p12
+*.pfx
+config.json
+all_keys.json
+
+# Private WeChat data and generated local artifacts
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.dat
+*.jsonl
+*.csv
+exports/
+decoded_images/
+cache/
+runtime/
+decrypted/
+logs/
+*.log
+*.bak
+*.swp
+~$*

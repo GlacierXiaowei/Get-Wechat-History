@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel>=0.40"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "get-wechat-history"
+version = "0.2.0"
+description = "Read, search, and export fresh local WeChat history through a read-only MCP server."
+requires-python = ">=3.10"
+dependencies = [
+  "mcp>=1.26,<2",
+  "pycryptodome>=3.23,<4",
+  "zstandard>=0.22,<1",
+]
+
+[tool.setuptools]
+packages = ["get_wechat_history"]

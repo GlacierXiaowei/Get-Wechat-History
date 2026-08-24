@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "get-wechat-history": {
+      "command": "cmd.exe",
+      "args": ["/d", "/s", "/c", "scripts\\plugin_bootstrap.cmd"],
+      "cwd": "."
+    }
+  }
+}

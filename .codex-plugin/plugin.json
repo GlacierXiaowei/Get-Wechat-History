@@ -1,0 +1,19 @@
+{
+  "name": "get-wechat-history",
+  "version": "0.2.0",
+  "description": "Read, search, and export fresh local WeChat history through a read-only MCP server.",
+  "author": {
+    "name": "Glacier Xiaowei"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Get Wechat History",
+    "shortDescription": "Read fresh local WeChat history.",
+    "longDescription": "Initializes and diagnoses the local WeChat history reader, then reads recent messages or a specified person or group, exports complete chat history, and decodes requested image messages.",
+    "developerName": "Glacier Xiaowei",
+    "category": "Productivity",
+    "capabilities": ["MCP server", "Skill"],
+    "defaultPrompt": "Prepare the local history reader when needed, then read the WeChat history I ask for and use only the minimum messages needed for my request."
+  },
+  "mcpServers": "./.mcp.json"
+}
