@@ -6,19 +6,57 @@ import os
 import re
 import sqlite3
 import tempfile
+import time
+import unicodedata
 from contextlib import closing
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import legacy_reader
 from .find_all_keys_windows import extract_all_keys
 from .image_key_scanner import find_key_for_dat, try_key
+from .contracts import validate_limit
 from .key_utils import get_key_info
 from .runtime_state import RuntimeState
 
 
 MESSAGE_DB_RE = re.compile(r"^message_(\d+)\.db$", re.IGNORECASE)
+DEFAULT_CACHE_AGE_SECONDS = 60 * 60
+
+
+def normalize_chat_search_text(value: Any) -> str:
+    """Normalize human chat-name clues without making punctuation significant."""
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return "".join(
+        character
+        for character in normalized
+        if not character.isspace() and not unicodedata.category(character).startswith(("P", "S"))
+    )
+
+
+def _chat_match_score(query: str, value: str, field_priority: int) -> float:
+    normalized_value = normalize_chat_search_text(value)
+    if not query or not normalized_value:
+        return 0.0
+    if normalized_value == query:
+        return 1000.0 - field_priority * 10
+    if normalized_value.startswith(query):
+        return 850.0 - field_priority * 10
+    if query in normalized_value:
+        return 700.0 - field_priority * 10
+    if len(query) >= 2:
+        query_position = 0
+        for character in normalized_value:
+            if character == query[query_position]:
+                query_position += 1
+                if query_position == len(query):
+                    return 520.0 - field_priority * 10
+        ratio = SequenceMatcher(None, query, normalized_value).ratio()
+        if ratio >= 0.55:
+            return 350.0 * ratio - field_priority * 10
+    return 0.0
 
 
 class ReaderUnavailableError(RuntimeError):
@@ -253,12 +291,25 @@ class LocalHistoryBackend:
         *,
         reader: Any = legacy_reader,
         key_scanner: Callable[[str, str], Any] = extract_all_keys,
+        clock: Callable[[], float] = time.monotonic,
+        cache_age_seconds: float = DEFAULT_CACHE_AGE_SECONDS,
     ):
         self.paths = paths or RuntimePaths()
         self.reader = reader
         self.key_scanner = key_scanner
+        self.clock = clock
+        self.cache_age_seconds = float(cache_age_seconds)
         self.db_dir: Path | None = None
         self._last_signature = ""
+        self._last_refresh_monotonic: float | None = None
+        self._snapshot: dict[str, Any] = {}
+        self._reader_config_key: tuple[str, str, str, str, str] | None = None
+        self._reader_keys_signature = ""
+        self._message_db_keys: list[str] = []
+        self._candidate_cache: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+        self._group_member_counts_cache: dict[str, int] | None = None
+        self._message_tables_cache: dict[str, list[dict[str, str]]] = {}
+        self._search_context_cache: dict[str, list[dict[str, Any]]] = {}
 
     def prepare(
         self,
@@ -266,8 +317,30 @@ class LocalHistoryBackend:
         configured_db_dir: str | os.PathLike[str] | None = None,
         allow_discovery: bool = False,
         allow_key_scan: bool = False,
+        force: bool = False,
     ) -> dict[str, Any]:
+        explicit_configuration = configured_db_dir is not None or allow_discovery or allow_key_scan
+        force = force or explicit_configuration
+        now = self.clock()
+        if (
+            not force
+            and self._snapshot
+            and self._last_refresh_monotonic is not None
+            and now - self._last_refresh_monotonic < self.cache_age_seconds
+        ):
+            snapshot = dict(self._snapshot)
+            snapshot.update(
+                {
+                    "cache_status": "reused",
+                    "cache_age_seconds": max(0.0, now - self._last_refresh_monotonic),
+                    "source_changed": False,
+                }
+            )
+            return snapshot
+
         self.paths.ensure()
+        if configured_db_dir is None and not allow_discovery and self.db_dir is not None:
+            configured_db_dir = self.db_dir
         self.db_dir = detect_db_dir(
             self.paths,
             allow_discovery=allow_discovery,
@@ -317,14 +390,26 @@ class LocalHistoryBackend:
                     status="keys_missing",
                 )
 
+        signature = source_signature(databases)
+        keys_signature = hashlib.sha256(
+            json.dumps(keys, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        reader_config_key = (
+            str(self.db_dir),
+            str(self.paths.keys),
+            str(self.paths.decrypted),
+            str(self.paths.decoded_images),
+            str(self.paths.cache),
+        )
+        source_changed = signature != self._last_signature
+        keys_changed = keys_signature != self._reader_keys_signature
+        first_configuration = self._reader_config_key is None
         try:
-            self.reader.configure_reader(
-                str(self.db_dir),
-                str(self.paths.keys),
-                str(self.paths.decrypted),
-                str(self.paths.decoded_images),
-                str(self.paths.cache),
-            )
+            if first_configuration or reader_config_key != self._reader_config_key:
+                self.reader.configure_reader(*reader_config_key)
+                self._reader_config_key = reader_config_key
+            elif source_changed or keys_changed:
+                self._refresh_reader_metadata()
         except Exception as exc:
             raise ReaderUnavailableError(
                 "The cached WeChat keys do not match this database path. Reinitialize this account.",
@@ -332,15 +417,50 @@ class LocalHistoryBackend:
             ) from exc
         if allow_discovery:
             RuntimeState(self.paths.root).save_db_dir(self.db_dir)
-        signature = source_signature(databases)
-        changed = signature != self._last_signature
+
+        if first_configuration or source_changed or keys_changed:
+            self._clear_query_metadata_caches(
+                invalidate_reader_cache=not first_configuration and (source_changed or keys_changed)
+            )
+        self._message_db_keys = discover_message_db_keys(self.db_dir)
         self._last_signature = signature
-        return {
+        self._reader_keys_signature = keys_signature
+        self._last_refresh_monotonic = now
+        self._snapshot = {
             "snapshot_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "source_changed": changed,
+            "source_changed": source_changed,
             "source_signature": signature,
             "database_count": len(databases),
+            "cache_status": "refreshed",
+            "cache_age_seconds": 0.0,
+            "refresh_reason": "forced" if force else "expired_or_initial",
         }
+        return dict(self._snapshot)
+
+    def _refresh_reader_metadata(self) -> None:
+        refresh = getattr(self.reader, "refresh_reader", None)
+        if callable(refresh):
+            refresh(str(self.paths.keys))
+            return
+        # Keep compatibility with older reader implementations. The bundled
+        # reader has refresh_reader(), so normal refreshes preserve its DBCache.
+        self.reader.configure_reader(
+            str(self.db_dir),
+            str(self.paths.keys),
+            str(self.paths.decrypted),
+            str(self.paths.decoded_images),
+            str(self.paths.cache),
+        )
+
+    def _clear_query_metadata_caches(self, *, invalidate_reader_cache: bool = False) -> None:
+        self._candidate_cache.clear()
+        self._group_member_counts_cache = None
+        self._message_tables_cache.clear()
+        self._search_context_cache.clear()
+        if invalidate_reader_cache:
+            invalidate = getattr(self.reader, "invalidate_contact_cache", None)
+            if callable(invalidate):
+                invalidate()
 
     def snapshot_is_current(self, snapshot: dict[str, Any]) -> bool:
         if self.db_dir is None:
@@ -349,6 +469,8 @@ class LocalHistoryBackend:
         return source_signature(databases) == snapshot.get("source_signature")
 
     def _group_member_counts(self) -> dict[str, int]:
+        if self._group_member_counts_cache is not None:
+            return dict(self._group_member_counts_cache)
         result: dict[str, int] = {}
         db_path = self.reader._get_contact_db_path()
         if not db_path:
@@ -362,13 +484,45 @@ class LocalHistoryBackend:
             count = count_top_level_repeated_field(ext_buffer, 1)
             if count is not None:
                 result[username] = count
+        self._group_member_counts_cache = dict(result)
         return result
 
-    def find_chat_candidates(self, query: str) -> list[dict[str, Any]]:
-        query_folded = query.casefold()
+    def find_chat_candidates(
+        self,
+        query: str,
+        *,
+        groups_only: bool = False,
+        member_count: int | None = None,
+        min_member_count: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = str(query or "").strip()
+        query_folded = normalize_chat_search_text(query)
+        if not query_folded:
+            return []
+        cache_key = (query_folded, groups_only, member_count, min_member_count)
+        cached = self._candidate_cache.get(cache_key)
+        if cached is not None:
+            return [dict(candidate) for candidate in cached]
+
+        if query.startswith("wxid_") or "@chatroom" in query:
+            is_group = "@chatroom" in query
+            if groups_only and not is_group:
+                return []
+            member_counts = self._group_member_counts() if is_group else {}
+            candidate = {
+                "id": query,
+                "display_name": self.reader.get_contact_names().get(query, query),
+                "nick_name": "",
+                "remark": "",
+                "is_group": is_group,
+                "member_count": member_counts.get(query),
+            }
+            self._candidate_cache[cache_key] = [dict(candidate)]
+            return [candidate]
+
         contacts = self.reader.get_contact_full()
         member_counts = self._group_member_counts()
-        candidates: list[tuple[bool, dict[str, Any]]] = []
+        candidates: list[tuple[float, dict[str, Any]]] = []
         seen: set[str] = set()
 
         for contact in contacts:
@@ -376,50 +530,73 @@ class LocalHistoryBackend:
             nick_name = contact.get("nick_name", "")
             remark = contact.get("remark", "")
             display_name = remark or nick_name or username
-            fields = [username, display_name, nick_name, remark]
-            exact = any(value and value.casefold() == query_folded for value in fields)
-            fuzzy = any(value and query_folded in value.casefold() for value in fields)
-            if not (exact or fuzzy) or username in seen:
+            is_group = "@chatroom" in username
+            if groups_only and not is_group:
+                continue
+            fields = [display_name, nick_name, remark, username]
+            score = max(
+                (_chat_match_score(query_folded, value, priority) for priority, value in enumerate(fields)),
+                default=0.0,
+            )
+            if not score or username in seen:
                 continue
             seen.add(username)
             candidates.append(
                 (
-                    exact,
+                    score,
                     {
                         "id": username,
                         "display_name": display_name,
                         "nick_name": nick_name,
                         "remark": remark,
-                        "is_group": "@chatroom" in username,
+                        "is_group": is_group,
                         "member_count": member_counts.get(username),
                     },
                 )
             )
 
-        if query not in seen and (query.startswith("wxid_") or "@chatroom" in query):
-            candidates.append(
-                (
-                    True,
-                    {
-                        "id": query,
-                        "display_name": self.reader.get_contact_names().get(query, query),
-                        "nick_name": "",
-                        "remark": "",
-                        "is_group": "@chatroom" in query,
-                        "member_count": member_counts.get(query),
-                    },
-                )
-            )
+        def count_rank(item: tuple[float, dict[str, Any]]) -> tuple[int, int, float, str]:
+            score, candidate = item
+            actual = candidate.get("member_count")
+            if actual is None:
+                return (1, 10**9, -score, candidate["id"])
+            try:
+                actual_count = int(actual)
+            except (TypeError, ValueError):
+                return (1, 10**9, -score, candidate["id"])
+            min_penalty = 0 if min_member_count is None or actual_count >= min_member_count else 1
+            distance = abs(actual_count - member_count) if member_count is not None else 0
+            return (min_penalty, distance, -score, candidate["id"])
 
-        exact_candidates = [candidate for exact, candidate in candidates if exact]
+        candidates.sort(key=count_rank)
+        exact_candidates = [candidate for score, candidate in candidates if score >= 990.0]
         selected = exact_candidates or [candidate for _, candidate in candidates]
-        selected.sort(key=lambda candidate: (candidate["display_name"].casefold(), candidate["id"]))
+        self._candidate_cache[cache_key] = [dict(candidate) for candidate in selected]
         return selected
 
+    def search_chats(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+        member_count: int | None = None,
+        min_member_count: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.find_chat_candidates(
+            query,
+            groups_only=True,
+            member_count=member_count,
+            min_member_count=min_member_count,
+        )[: validate_limit(limit)]
+
     def _message_tables_for_chat(self, chat_id: str) -> list[dict[str, str]]:
+        cached = self._message_tables_cache.get(chat_id)
+        if cached is not None:
+            return [dict(table) for table in cached]
         table_name = f"Msg_{hashlib.md5(chat_id.encode()).hexdigest()}"
         matches = []
-        for rel_key in discover_message_db_keys(self.db_dir):
+        rel_keys = self._message_db_keys or discover_message_db_keys(self.db_dir)
+        for rel_key in rel_keys:
             db_path = self.reader._cache.get(rel_key)
             if not db_path:
                 continue
@@ -432,6 +609,7 @@ class LocalHistoryBackend:
                 exists = None
             if exists:
                 matches.append({"rel_key": rel_key, "db_path": db_path, "table_name": table_name})
+        self._message_tables_cache[chat_id] = [dict(table) for table in matches]
         return matches
 
     @staticmethod
@@ -461,6 +639,7 @@ class LocalHistoryBackend:
         is_group: bool,
         names: dict[str, str],
         id_to_username: dict[int, str],
+        include_raw_content: bool = False,
     ) -> dict[str, Any] | None:
         local_id, local_type, create_time, real_sender_id, content, content_type = row
         raw_content = self.reader._decompress_content(content, content_type)
@@ -482,7 +661,7 @@ class LocalHistoryBackend:
             id_to_username,
         )
         timestamp_unix = int(create_time or 0)
-        return {
+        record = {
             "message_id": f"{rel_key}:{local_id}",
             "source_db": rel_key,
             "local_id": int(local_id),
@@ -496,8 +675,10 @@ class LocalHistoryBackend:
             "type": self._message_type(local_type),
             "type_id": int(local_type),
             "text": text or "",
-            "raw_content": raw_content,
         }
+        if include_raw_content:
+            record["raw_content"] = raw_content
+        return record
 
     def _records_from_table(
         self,
@@ -511,6 +692,7 @@ class LocalHistoryBackend:
         end_time: str,
         candidate_limit: int | None,
         before: dict[str, Any] | None = None,
+        include_raw_content: bool = False,
     ) -> list[dict[str, Any]]:
         start_ts, end_ts = self.reader._parse_time_range(start_time, end_time)
         names = self.reader.get_contact_names()
@@ -551,6 +733,7 @@ class LocalHistoryBackend:
                 is_group=is_group,
                 names=names,
                 id_to_username=id_to_username,
+                include_raw_content=include_raw_content,
             )
             if record is not None:
                 records.append(record)
@@ -565,6 +748,7 @@ class LocalHistoryBackend:
         keyword: str,
         start_time: str,
         end_time: str,
+        include_raw_content: bool = False,
     ) -> tuple[list[dict[str, Any]], bool]:
         names = self.reader.get_contact_names()
         chat_name = names.get(chat_id, chat_id)
@@ -581,6 +765,7 @@ class LocalHistoryBackend:
                     end_time=end_time,
                     candidate_limit=limit + 1,
                     before=before,
+                    include_raw_content=include_raw_content,
                 )
             )
         return merge_message_page(entries, limit=limit, before=before)
@@ -601,10 +786,25 @@ class LocalHistoryBackend:
                     end_time=end_time,
                     candidate_limit=None,
                     before=None,
+                    include_raw_content=True,
                 )
             )
         entries.sort(key=lambda item: (item["timestamp_unix"], item["message_id"]))
         yield from entries
+
+    def _search_contexts_for_db(
+        self,
+        rel_key: str,
+        db_path: str,
+        names: dict[str, str],
+        connection: sqlite3.Connection,
+    ) -> list[dict[str, Any]]:
+        cached = self._search_context_cache.get(rel_key)
+        if cached is not None:
+            return [dict(context) for context in cached]
+        contexts = self.reader._load_search_contexts_from_db(connection, db_path, names)
+        self._search_context_cache[rel_key] = [dict(context) for context in contexts]
+        return contexts
 
     def read_recent_records(
         self,
@@ -614,21 +814,27 @@ class LocalHistoryBackend:
         keyword: str,
         start_time: str,
         end_time: str,
+        include_raw_content: bool = False,
     ) -> tuple[list[dict[str, Any]], bool]:
         if not keyword and not start_time and not end_time:
-            session_page = self._read_unfiltered_recent_from_sessions(limit=limit, before=before)
+            session_page = self._read_unfiltered_recent_from_sessions(
+                limit=limit,
+                before=before,
+                include_raw_content=include_raw_content,
+            )
             if session_page is not None:
                 return session_page
 
         names = self.reader.get_contact_names()
         entries = []
         candidate_limit = limit + 1
-        for rel_key in discover_message_db_keys(self.db_dir):
+        rel_keys = self._message_db_keys or discover_message_db_keys(self.db_dir)
+        for rel_key in rel_keys:
             db_path = self.reader._cache.get(rel_key)
             if not db_path:
                 continue
             with closing(sqlite3.connect(db_path)) as connection:
-                contexts = self.reader._load_search_contexts_from_db(connection, db_path, names)
+                contexts = self._search_contexts_for_db(rel_key, db_path, names, connection)
             for context in contexts:
                 table = {"rel_key": rel_key, "db_path": db_path, "table_name": context["table_name"]}
                 entries.extend(
@@ -642,12 +848,17 @@ class LocalHistoryBackend:
                         end_time=end_time,
                         candidate_limit=candidate_limit,
                         before=before,
+                        include_raw_content=include_raw_content,
                     )
                 )
         return merge_message_page(entries, limit=limit, before=before)
 
     def _read_unfiltered_recent_from_sessions(
-        self, *, limit: int, before: dict[str, Any] | None
+        self,
+        *,
+        limit: int,
+        before: dict[str, Any] | None,
+        include_raw_content: bool = False,
     ) -> tuple[list[dict[str, Any]], bool] | None:
         session_path = self.reader._cache.get("session/session.db")
         if not session_path:
@@ -663,13 +874,14 @@ class LocalHistoryBackend:
 
         names = self.reader.get_contact_names()
         contexts_by_username: dict[str, list[dict[str, str]]] = {}
-        for rel_key in discover_message_db_keys(self.db_dir):
+        rel_keys = self._message_db_keys or discover_message_db_keys(self.db_dir)
+        for rel_key in rel_keys:
             db_path = self.reader._cache.get(rel_key)
             if not db_path:
                 continue
             try:
                 with closing(sqlite3.connect(db_path)) as connection:
-                    contexts = self.reader._load_search_contexts_from_db(connection, db_path, names)
+                    contexts = self._search_contexts_for_db(rel_key, db_path, names, connection)
             except sqlite3.Error:
                 continue
             for context in contexts:
@@ -711,6 +923,7 @@ class LocalHistoryBackend:
                         end_time="",
                         candidate_limit=candidate_limit,
                         before=before,
+                        include_raw_content=include_raw_content,
                     )
                 )
 

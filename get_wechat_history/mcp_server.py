@@ -20,40 +20,48 @@ mcp = FastMCP(
     instructions=(
         "Read local WeChat history through the configured database path. "
         "Initialize once when setup is missing, use doctor for environment checks, "
-        "and use paged reads for fresh results."
+        "check freshness once per task, search chats before reading messages, "
+        "and use paged reads for compact results."
     ),
 )
+
+
+def _error_result(scope: str, status: str, error: str) -> dict[str, Any]:
+    result = {
+        "status": status,
+        "scope": scope,
+        "chat": None,
+        "messages": [],
+        "count": 0,
+        "next_cursor": "",
+        "has_more": False,
+        "candidates": [],
+        "snapshot_at": "",
+        "cache_status": "",
+        "source_changed": False,
+        "error": error,
+    }
+    if scope == "chat_search":
+        result["chats"] = []
+    if scope == "freshness":
+        result.update(
+            {
+                "cache_status": "",
+                "refreshed": False,
+                "source_changed": False,
+                "snapshot": {},
+            }
+        )
+    return result
 
 
 def safe_call(scope: str, callback: Callable[[], dict[str, Any]]) -> dict[str, Any]:
     try:
         return callback()
     except ReaderUnavailableError as exc:
-        return {
-            "status": exc.status,
-            "scope": scope,
-            "chat": None,
-            "messages": [],
-            "count": 0,
-            "next_cursor": "",
-            "has_more": False,
-            "candidates": [],
-            "snapshot_at": "",
-            "error": str(exc),
-        }
+        return _error_result(scope, exc.status, str(exc))
     except Exception as exc:
-        return {
-            "status": "error",
-            "scope": scope,
-            "chat": None,
-            "messages": [],
-            "count": 0,
-            "next_cursor": "",
-            "has_more": False,
-            "candidates": [],
-            "snapshot_at": "",
-            "error": str(exc),
-        }
+        return _error_result(scope, "error", str(exc))
 
 
 @mcp.tool()
@@ -77,12 +85,48 @@ def doctor_wechat_history() -> dict[str, Any]:
 
 
 @mcp.tool()
+def ensure_wechat_history_fresh(force: bool = False) -> dict[str, Any]:
+    """Check whether the local history snapshot is fresh and refresh changed source state when needed.
+
+    Args:
+        force: Check the source now even when the one-hour cache window has not elapsed.
+    """
+    return safe_call(
+        "freshness",
+        lambda: service.ensure_wechat_history_fresh(force=force),
+    )
+
+
+@mcp.tool()
+def search_chats(
+    query: str,
+    limit: int = 20,
+    member_count: int | None = None,
+    min_member_count: int | None = None,
+) -> dict[str, Any]:
+    """Find likely group chats by fuzzy name, nickname, remark, or chat id.
+
+    Member counts are optional hints used for ranking only; they never filter out a group.
+    """
+    return safe_call(
+        "chat_search",
+        lambda: service.search_chats(
+            query,
+            limit=limit,
+            member_count=member_count,
+            min_member_count=min_member_count,
+        ),
+    )
+
+
+@mcp.tool()
 def read_recent_messages(
-    limit: int,
+    limit: int = 100,
     cursor: str = "",
     keyword: str = "",
     start_time: str = "",
     end_time: str = "",
+    include_raw_content: bool = False,
 ) -> dict[str, Any]:
     """Read an actual page of the newest local messages across chats."""
     return safe_call(
@@ -93,6 +137,7 @@ def read_recent_messages(
             keyword=keyword,
             start_time=start_time,
             end_time=end_time,
+            include_raw_content=include_raw_content,
         ),
     )
 
@@ -100,15 +145,16 @@ def read_recent_messages(
 @mcp.tool()
 def read_chat_history(
     chat: str,
-    limit: int,
+    limit: int = 100,
     cursor: str = "",
     keyword: str = "",
     start_time: str = "",
     end_time: str = "",
     member_count: int | None = None,
     min_member_count: int | None = None,
+    include_raw_content: bool = False,
 ) -> dict[str, Any]:
-    """Read a page from one person or group without silently choosing duplicates."""
+    """Read a page from one resolved person or group without silently choosing duplicates."""
     return safe_call(
         "chat",
         lambda: service.read_chat_history(
@@ -120,6 +166,7 @@ def read_chat_history(
             end_time=end_time,
             member_count=member_count,
             min_member_count=min_member_count,
+            include_raw_content=include_raw_content,
         ),
     )
 

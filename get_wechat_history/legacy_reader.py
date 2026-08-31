@@ -694,6 +694,35 @@ def configure_reader(db_dir, keys_file, decrypted_dir, decoded_image_dir, cache_
     _image_resolver = ImageResolver(WECHAT_BASE_DIR, DECODED_IMAGE_DIR, _cache)
 
 
+def refresh_reader(keys_file=None):
+    """Reload key metadata while preserving the process-local DBCache."""
+    global KEYS_FILE, ALL_KEYS, MSG_DB_KEYS
+
+    if keys_file:
+        KEYS_FILE = os.path.abspath(keys_file)
+    try:
+        with open(KEYS_FILE, encoding="utf-8") as handle:
+            ALL_KEYS = strip_key_metadata(json.load(handle))
+    except (OSError, json.JSONDecodeError):
+        ALL_KEYS = {}
+
+    MSG_DB_KEYS = sorted([
+        key
+        for key in ALL_KEYS
+        if any(value.replace("\\", "/").startswith("message/") for value in key_path_variants(key))
+        and any(re.search(r"message_\d+\.db$", value.replace("\\", "/")) for value in key_path_variants(key))
+    ])
+
+
+def invalidate_contact_cache():
+    """Drop only contact-derived metadata after a source database change."""
+    global _contact_names, _contact_full, _contact_tags, _self_username
+    _contact_names = None
+    _contact_full = None
+    _contact_tags = None
+    _self_username = None
+
+
 def _find_msg_table_for_user(username):
     """在所有 message_N.db 中查找用户的消息表，返回 (db_path, table_name)"""
     table_hash = hashlib.md5(username.encode()).hexdigest()

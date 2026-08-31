@@ -18,10 +18,22 @@ Use only the plugin MCP tools. Never use shell commands, scan folders, or substi
 
 ## Reading
 
-For every new read request, call a tool again so it checks the current encrypted databases and WAL. Do not reuse an earlier tool response as fresh data.
+At the beginning of each new Codex task that needs WeChat history, call `ensure_wechat_history_fresh(force=true)` once. This establishes or checks the task snapshot. Do not call it before every page or every message query.
 
-- `read_recent_messages`: latest messages across chats; choose a practical positive `limit` and continue with `next_cursor` only when needed.
-- `read_chat_history`: a named person or group with time, keyword, and page filters. If `ambiguous`, show candidates and use a member-count clue or exact id; never select the first match silently.
+- The default freshness window is one hour. Later reads in the same task reuse the in-process reader, decrypted database cache, contact metadata, and query results when the request is identical.
+- When the window expires, the plugin checks database and WAL signatures, invalidates changed metadata only, and preserves the reader cache for unchanged shards.
+- If the user asks for “latest”, “just now”, “refresh”, “recheck”, or not to use cache, call `ensure_wechat_history_fresh(force=true)` again. `force` checks the source immediately; it does not imply rebuilding every cache.
+
+For a vague or approximate group name, search before reading messages:
+
+- Call `search_chats(query)` first. It performs fuzzy matching over group name, nickname, remark, and chat id, with punctuation, spacing, and case normalized.
+- `member_count` and `min_member_count` are optional ranking hints only. They must never filter out a group because the user may have supplied an approximate or incorrect count.
+- If the search returns one strong match, read it with the returned `chat_id`. If it returns multiple plausible matches, show the minimal choice list and ask which one to use; do not silently select the first weak match.
+- Once the target group is known, call `read_chat_history` by `chat_id` instead of running a global keyword scan with `read_recent_messages`.
+
+- `read_recent_messages`: latest messages across chats; the default limit is 100. Continue with `next_cursor` only when needed.
+- `read_chat_history`: a named person or group with time, keyword, and page filters. `member_count` is optional and never a hard identity constraint. If `ambiguous`, use `search_chats` and an exact `chat_id`; never select the first weak match silently.
+- Ordinary reads return compact message fields: `message_id`, `timestamp`, `sender_name`, `type`, and `text`. Set `include_raw_content=true` only when raw XML or payload evidence is specifically needed. Exports retain the full raw record.
 - `export_chat_history`: all locally available records for one resolved chat; omit time bounds for a complete export and return paths/metadata.
 - `decode_image`: an image message returned by a history read.
 

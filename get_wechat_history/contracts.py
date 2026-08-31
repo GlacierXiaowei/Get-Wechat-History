@@ -60,21 +60,25 @@ def resolve_candidate(
     member_count: int | None = None,
     min_member_count: int | None = None,
 ) -> tuple[str, dict[str, Any] | None, list[dict[str, Any]]]:
+    # Counts are user-provided clues, not identity constraints. A stale or
+    # approximate count must never hide an otherwise valid chat candidate.
     remaining = list(candidates)
-    if member_count is not None:
-        remaining = [
-            candidate
-            for candidate in remaining
-            if candidate.get("member_count") is not None
-            and abs(int(candidate["member_count"]) - member_count) <= 2
-        ]
-    if min_member_count is not None:
-        remaining = [
-            candidate
-            for candidate in remaining
-            if candidate.get("member_count") is not None
-            and int(candidate["member_count"]) >= min_member_count
-        ]
+
+    def hint_rank(item: tuple[int, dict[str, Any]]) -> tuple[int, int, int]:
+        position, candidate = item
+        actual = candidate.get("member_count")
+        if actual is None:
+            return (1, 10**9, position)
+        try:
+            actual_count = int(actual)
+        except (TypeError, ValueError):
+            return (1, 10**9, position)
+        min_penalty = 0 if min_member_count is None or actual_count >= min_member_count else 1
+        distance = abs(actual_count - member_count) if member_count is not None else 0
+        return (min_penalty, distance, position)
+
+    if member_count is not None or min_member_count is not None:
+        remaining = [candidate for _, candidate in sorted(enumerate(remaining), key=hint_rank)]
 
     if not remaining:
         return "not_found", None, []

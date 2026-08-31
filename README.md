@@ -3,7 +3,7 @@
 想要让AI能够快速获取微信聊天记录？其他开源项目操作繁琐，配置困难？
 那就使用Get Wechat History！只需安装该插件，就可以一键获取！
 
-Get Wechat History是一个 Codex 插件，用于读取本机微信聊天记录、查询指定会话、导出记录，以及解码读取结果中的图片。用户在 Codex 中直接提出需求即可通过该插件读取完整的微信聊天记录。
+Get Wechat History是一个 Codex 插件，用于搜索并读取本机微信聊天记录、查询指定会话、导出记录，以及解码读取结果中的图片。插件会复用一小时内的本地读取缓存，并在需要时只检查发生变化的数据库/WAL。
 
 ## 使用前提
 
@@ -60,6 +60,7 @@ Get Wechat History是一个 Codex 插件，用于读取本机微信聊天记录�
 初始化完成后，可以直接提出读取需求，例如：
 
 - 读取我最近的微信消息；
+- 按模糊群名搜索群聊；
 - 读取某个联系人最近的聊天记录；
 - 读取某个群聊最近的聊天记录；
 - 导出某个群聊的聊天记录；
@@ -107,9 +108,13 @@ Get Wechat History是一个 Codex 插件，用于读取本机微信聊天记录�
 
 - `initialize_wechat_history(db_dir="", discover=false)`：首次配置或重新配置。
 - `doctor_wechat_history()`：检查环境和当前配置。
-- `read_recent_messages(...)`：读取最新消息分页。
-- `read_chat_history(...)`：读取指定联系人或群聊分页。
+- `ensure_wechat_history_fresh(force=false)`：让插件判断缓存是否需要刷新；新任务首次读取时使用 `force=true` 做一次检查。
+- `search_chats(query, limit=20, member_count=null, min_member_count=null)`：按群名称、昵称、备注或 id 模糊搜索群聊。人数只用于排序提示，不会过滤结果。
+- `read_recent_messages(...)`：读取最新消息分页，默认返回精简字段。
+- `read_chat_history(...)`：读取指定联系人或群聊分页；建议先搜索群，再用返回的 `chat_id` 读取。
 - `export_chat_history(...)`：导出指定会话的本地记录。
 - `decode_image(...)`：解码读取结果中的图片消息。
 
-读取工具每次都会针对当前数据库和 WAL 文件建立新快照。
+普通读取默认只返回 `message_id`、`timestamp`、`sender_name`、`type`、`text`。需要核对 XML 或底层载荷时，再传 `include_raw_content=true`；导出仍保留完整原始记录。
+
+读取工具默认复用一小时内的快照、解密缓存和查询结果。用户明确要求“最新消息”“刷新”“重新核验”或“不使用缓存”时，调用 `ensure_wechat_history_fresh(force=true)`。
