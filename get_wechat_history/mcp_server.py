@@ -5,6 +5,7 @@ from typing import Any, Callable
 from mcp.server.fastmcp import FastMCP
 
 from .exporter import HistoryExporter
+from .find_all_keys_windows import SCANNER_BUILD_ID
 from .local_backend import LocalHistoryBackend, ReaderUnavailableError, RuntimePaths
 from .service import HistoryService
 
@@ -72,16 +73,20 @@ def initialize_wechat_history(db_dir: str = "", discover: bool = False) -> dict[
         db_dir: Known WeChat db_storage directory. Leave empty only when discover is true.
         discover: Permit one controlled local WeChat data-directory discovery during initialization.
     """
-    return safe_call(
+    result = safe_call(
         "initialize",
         lambda: service.initialize_wechat_history(db_dir=db_dir, discover=discover),
     )
+    result["scanner_build_id"] = SCANNER_BUILD_ID
+    return result
 
 
 @mcp.tool()
 def doctor_wechat_history() -> dict[str, Any]:
     """Check Python, saved path, desktop WeChat process, and cached-key compatibility."""
-    return safe_call("doctor", service.doctor_wechat_history)
+    result = safe_call("doctor", service.doctor_wechat_history)
+    result["scanner_build_id"] = SCANNER_BUILD_ID
+    return result
 
 
 @mcp.tool()

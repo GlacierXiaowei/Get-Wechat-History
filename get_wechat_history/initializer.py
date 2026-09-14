@@ -63,8 +63,20 @@ class HistoryInitializer:
                 self.state.save_db_dir(selected_text)
             return self._response("ok", db_dir=selected_text, snapshot=snapshot)
         except ReaderUnavailableError as exc:
-            selected_text = str(configured_path) if configured_path else self.state.load().db_dir
+            selected_text = self._failed_path(configured_path, exc.status)
             return self._response(exc.status, db_dir=selected_text, error=str(exc))
         except Exception as exc:
-            selected_text = str(configured_path) if configured_path else self.state.load().db_dir
-            return self._response("error", db_dir=selected_text, error=str(exc))
+            selected_text = self._failed_path(configured_path, "error")
+            return self._response(
+                "error",
+                db_dir=selected_text,
+                error=f"Initialization failed ({type(exc).__name__}).",
+            )
+
+    def _failed_path(self, requested: Path | None, status: str) -> str:
+        configuration = self.state.load()
+        selected = str(requested) if requested else configuration.pending_db_dir
+        if selected and configuration.pending_db_dir:
+            if Path(selected).resolve() == Path(configuration.pending_db_dir).resolve():
+                self.state.save_pending_db_dir(selected, status)
+        return selected or configuration.db_dir

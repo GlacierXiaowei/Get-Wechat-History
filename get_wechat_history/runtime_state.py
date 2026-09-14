@@ -13,6 +13,8 @@ from typing import Any
 class RuntimeConfig:
     schema_version: int = 1
     db_dir: str = ""
+    pending_db_dir: str = ""
+    pending_validation_status: str = ""
     last_validated_at: str = ""
     last_validation_status: str = ""
 
@@ -41,6 +43,8 @@ class RuntimeState:
         return RuntimeConfig(
             schema_version=schema_version,
             db_dir=str(data.get("db_dir", "") or ""),
+            pending_db_dir=str(data.get("pending_db_dir", "") or ""),
+            pending_validation_status=str(data.get("pending_validation_status", "") or ""),
             last_validated_at=str(data.get("last_validated_at", "") or ""),
             last_validation_status=str(data.get("last_validation_status", "") or ""),
         )
@@ -57,8 +61,27 @@ class RuntimeState:
             {
                 "schema_version": 1,
                 "db_dir": str(Path(db_dir)),
-                "last_validated_at": "",
-                "last_validation_status": "",
+                "pending_db_dir": "",
+                "pending_validation_status": "",
+                "last_validated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "last_validation_status": "ok",
+            }
+        )
+        self._write(data)
+        return self.load()
+
+    def save_pending_db_dir(
+        self,
+        db_dir: str | os.PathLike[str],
+        status: str = "pending",
+    ) -> RuntimeConfig:
+        """Keep an attempted path diagnosable without replacing the active account."""
+        data = self._read_raw()
+        data.update(
+            {
+                "schema_version": 1,
+                "pending_db_dir": str(Path(db_dir)),
+                "pending_validation_status": status,
             }
         )
         self._write(data)

@@ -1,158 +1,149 @@
-"""
-从微信进程内存中提取所有数据库的缓存raw key
+"""Authenticated local key recovery for modern and legacy Windows Weixin."""
+from __future__ import annotations
 
-WCDB为每个DB缓存: x'<64hex_enc_key><32hex_salt>'
-salt嵌在hex字符串中，可以直接匹配DB文件的salt
-"""
-import ctypes
-import ctypes.wintypes as wt
-import os, sys, time, re, builtins
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import time
+import traceback
 
-def print(*args, **kwargs):
-    if os.environ.get("GET_WECHAT_HISTORY_DEBUG") != "1":
-        return
-    kwargs.setdefault("flush", True)
-    kwargs.setdefault("file", sys.stderr)
-    builtins.print(*args, **kwargs)
-
-from .key_scan_common import (
-    collect_db_files, scan_memory_for_keys, cross_verify_keys, save_results,
-)
-
-kernel32 = ctypes.windll.kernel32
-MEM_COMMIT = 0x1000
-READABLE = {0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80}
+from .key_scan_common import collect_db_files, cross_verify_keys, save_results, scan_memory_for_keys
+from .modern_keys_windows import ProcessMemory, candidates, recover_modern_keys
 
 
-class MBI(ctypes.Structure):
-    _fields_ = [
-        ("BaseAddress", ctypes.c_uint64), ("AllocationBase", ctypes.c_uint64),
-        ("AllocationProtect", wt.DWORD), ("_pad1", wt.DWORD),
-        ("RegionSize", ctypes.c_uint64), ("State", wt.DWORD),
-        ("Protect", wt.DWORD), ("Type", wt.DWORD), ("_pad2", wt.DWORD),
-    ]
+def scanner_build_id() -> str:
+    digest = hashlib.sha256()
+    root = Path(__file__).parent
+    for name in ("find_all_keys_windows.py", "modern_keys_windows.py", "key_scan_common.py"):
+        digest.update((root / name).read_bytes())
+    return digest.hexdigest()[:16]
 
 
-def get_pids():
-    """返回所有 Weixin.exe 进程的 (pid, mem_kb) 列表，按内存降序"""
-    import subprocess
-    r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/FO", "CSV", "/NH"],
-                       capture_output=True, text=True)
-    pids = []
-    for line in r.stdout.strip().split('\n'):
-        if not line.strip():
-            continue
-        p = line.strip('"').split('","')
-        if len(p) >= 5:
-            pid = int(p[1])
-            mem = int(p[4].replace(',', '').replace(' K', '').strip() or '0')
-            pids.append((pid, mem))
-    if not pids:
-        raise RuntimeError("Weixin.exe 未运行")
-    pids.sort(key=lambda x: x[1], reverse=True)
-    for pid, mem in pids:
-        print(f"[+] Weixin.exe PID={pid} ({mem // 1024}MB)")
-    return pids
+SCANNER_BUILD_ID = scanner_build_id()
 
 
-def read_mem(h, addr, sz):
-    buf = ctypes.create_string_buffer(sz)
-    n = ctypes.c_size_t(0)
-    if kernel32.ReadProcessMemory(h, ctypes.c_uint64(addr), buf, sz, ctypes.byref(n)):
-        return buf.raw[:n.value]
+class ScanDiagnostics:
+    """Persist only fixed stage names, counts, PIDs, and system error codes."""
+
+    def __init__(self, directory: str | os.PathLike[str]):
+        self.path = Path(directory) / "key_scan_diagnostics.json"
+        self.events: list[dict[str, object]] = []
+
+    def __call__(self, stage: str, **fields):
+        event = {"stage": stage, **fields}
+        self.events.append(event)
+        if os.environ.get("GET_WECHAT_HISTORY_DEBUG") == "1":
+            print(json.dumps(event, ensure_ascii=True), file=sys.stderr, flush=True)
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps({"build_id": SCANNER_BUILD_ID, "events": self.events}, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(self.path)
+
+
+def _quiet(*args, **kwargs):
+    """Do not expose salts, keys, addresses, or database paths in diagnostics."""
     return None
 
 
-def enum_regions(h):
-    regs = []
-    addr = 0
-    mbi = MBI()
-    while addr < 0x7FFFFFFFFFFF:
-        if kernel32.VirtualQueryEx(h, ctypes.c_uint64(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)) == 0:
-            break
-        if mbi.State == MEM_COMMIT and mbi.Protect in READABLE and 0 < mbi.RegionSize < 500 * 1024 * 1024:
-            regs.append((mbi.BaseAddress, mbi.RegionSize))
-        nxt = mbi.BaseAddress + mbi.RegionSize
-        if nxt <= addr:
-            break
-        addr = nxt
-    return regs
-
-
-def extract_all_keys(db_dir, out_file):
-
-    print("=" * 60)
-    print("  提取所有微信数据库密钥")
-    print("=" * 60)
-
-    # 1. 收集所有DB文件及其salt
-    db_files, salt_to_dbs = collect_db_files(db_dir)
-
-    print(f"\n找到 {len(db_files)} 个数据库, {len(salt_to_dbs)} 个不同的salt")
-    for salt_hex, dbs in sorted(salt_to_dbs.items(), key=lambda x: len(x[1]), reverse=True):
-        print(f"  salt {salt_hex}: {', '.join(dbs)}")
-
-    # 2. 打开所有微信进程
-    pids = get_pids()
-
-    hex_re = re.compile(b"x'([0-9a-fA-F]{64,192})'")
-    key_map = {}
-    remaining_salts = set(salt_to_dbs.keys())
-    all_hex_matches = 0
-    t0 = time.time()
-
-    for pid, mem_kb in pids:
-        h = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
-        if not h:
-            print(f"[WARN] 无法打开进程 PID={pid}，跳过")
-            continue
-
+def _legacy_scan(db_files, salts, keys, remaining, report) -> None:
+    pattern = re.compile(rb"x'([0-9a-fA-F]{64,192})'")
+    for pid, name, _ in candidates():
+        matches = 0
+        before = len(keys)
         try:
-            regions = enum_regions(h)
-            total_bytes = sum(s for _, s in regions)
-            total_mb = total_bytes / 1024 / 1024
-            print(f"\n[*] 扫描 PID={pid} ({total_mb:.0f}MB, {len(regions)} 区域)")
-
-            scanned_bytes = 0
-            for reg_idx, (base, size) in enumerate(regions):
-                data = read_mem(h, base, size)
-                scanned_bytes += size
-                if not data:
-                    continue
-
-                all_hex_matches += scan_memory_for_keys(
-                    data, hex_re, db_files, salt_to_dbs,
-                    key_map, remaining_salts, base, pid, print,
-                )
-
-                if (reg_idx + 1) % 200 == 0:
-                    elapsed = time.time() - t0
-                    progress = scanned_bytes / total_bytes * 100 if total_bytes else 100
-                    print(
-                        f"  [{progress:.1f}%] {len(key_map)}/{len(salt_to_dbs)} salts matched, "
-                        f"{all_hex_matches} hex patterns, {elapsed:.1f}s"
+            with ProcessMemory(pid, report) as process:
+                for base, data in process.chunks(private_only=False, overlap=255):
+                    matches += scan_memory_for_keys(
+                        data,
+                        pattern,
+                        db_files,
+                        salts,
+                        keys,
+                        remaining,
+                        base,
+                        pid,
+                        _quiet,
                     )
-        finally:
-            kernel32.CloseHandle(h)
-
-        if not remaining_salts:
-            print(f"\n[+] 所有密钥已找到，跳过剩余进程")
+                    if not remaining:
+                        break
+            report(
+                "legacy_scan",
+                pid=pid,
+                name=name,
+                matches=matches,
+                verified=len(keys) - before,
+            )
+        except OSError as exc:
+            report(
+                "legacy_failure",
+                pid=pid,
+                exception=type(exc).__name__,
+                error=exc.errno,
+            )
+        if not remaining:
             break
-
-    elapsed = time.time() - t0
-    print(f"\n扫描完成: {elapsed:.1f}s, {len(pids)} 个进程, {all_hex_matches} hex模式")
-
-    cross_verify_keys(db_files, salt_to_dbs, key_map, print)
-    save_results(db_files, salt_to_dbs, key_map, db_dir, out_file, print)
+    cross_verify_keys(db_files, salts, keys, _quiet)
 
 
-def main():
-    raise RuntimeError("Use the Get Wechat History MCP server to refresh keys.")
-
-
-if __name__ == '__main__':
+def extract_all_keys(db_dir: str, out_file: str) -> None:
+    """Try modern authenticated recovery, then retain the legacy fallback."""
+    report = ScanDiagnostics(Path(out_file).parent)
+    started = time.monotonic()
     try:
-        main()
-    except RuntimeError as e:
-        print(f"\n[ERROR] {e}")
-        sys.exit(1)
+        report("start", build_id=SCANNER_BUILD_ID)
+        db_files, salts = collect_db_files(db_dir)
+        report("database_collection", count=len(db_files), salts=len(salts))
+
+        keys = {}
+        try:
+            keys = recover_modern_keys(db_files, report)
+        except Exception as exc:
+            report("modern_failure", exception=type(exc).__name__)
+
+        remaining = set(salts) - set(keys)
+        if remaining:
+            try:
+                _legacy_scan(db_files, salts, keys, remaining, report)
+            except Exception as exc:
+                report("legacy_failure", exception=type(exc).__name__)
+
+        report(
+            "complete",
+            verified=len(keys),
+            total=len(salts),
+            elapsed_seconds=round(time.monotonic() - started, 2),
+        )
+        if not keys:
+            raise RuntimeError(
+                "No authenticated database key found. "
+                "See sanitized key_scan_diagnostics.json for candidate stages."
+            )
+        save_results(db_files, salts, keys, db_dir, out_file, _quiet)
+    except Exception as exc:
+        report(
+            "exception",
+            exception=type(exc).__name__,
+            frames=[
+                {
+                    "file": Path(frame.filename).name,
+                    "line": frame.lineno,
+                    "function": frame.name,
+                }
+                for frame in traceback.extract_tb(exc.__traceback__)
+            ],
+        )
+        raise
+    finally:
+        report.save()
+
+
+if __name__ == "__main__":
+    raise SystemExit("Use initialize_wechat_history to recover keys for a chosen database path.")

@@ -19,6 +19,7 @@ from .find_all_keys_windows import extract_all_keys
 from .image_key_scanner import find_key_for_dat, try_key
 from .contracts import validate_limit
 from .key_utils import get_key_info
+from .key_scan_common import PAGE_SZ, verify_enc_key
 from .runtime_state import RuntimeState
 
 
@@ -193,7 +194,8 @@ def merge_message_page(
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
 
@@ -280,7 +282,7 @@ def detect_db_dir(
         )
     selected = max(candidates, key=_candidate_activity)
     if persist_discovery:
-        RuntimeState(paths.root).save_db_dir(selected)
+        RuntimeState(paths.root).save_pending_db_dir(selected)
     return selected
 
 
@@ -312,6 +314,26 @@ class LocalHistoryBackend:
         self._search_context_cache: dict[str, list[dict[str, Any]]] = {}
 
     def prepare(
+        self,
+        *,
+        configured_db_dir: str | os.PathLike[str] | None = None,
+        allow_discovery: bool = False,
+        allow_key_scan: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        previous_db_dir = self.db_dir
+        try:
+            return self._prepare(
+                configured_db_dir=configured_db_dir,
+                allow_discovery=allow_discovery,
+                allow_key_scan=allow_key_scan,
+                force=force,
+            )
+        except Exception:
+            self.db_dir = previous_db_dir
+            raise
+
+    def _prepare(
         self,
         *,
         configured_db_dir: str | os.PathLike[str] | None = None,
@@ -353,53 +375,60 @@ class LocalHistoryBackend:
                 f"No encrypted WeChat databases were found under {self.db_dir}.",
                 status="database_missing",
             )
+        if allow_key_scan:
+            RuntimeState(self.paths.root).save_pending_db_dir(self.db_dir)
 
         keys = _read_json(self.paths.keys)
-        missing = [
-            path
-            for path in databases
-            if get_key_info(keys, _normalize_rel(path, self.db_dir)) is None
-        ]
-        if missing and not allow_key_scan:
-            names = ", ".join(_normalize_rel(path, self.db_dir) for path in missing[:5])
-            raise ReaderUnavailableError(
-                f"Missing decryption keys for: {names}. Initialize while desktop WeChat is running.",
-                status="keys_missing",
+        missing, invalid = self._validate_keys(databases, keys)
+        if (missing or invalid) and not allow_key_scan:
+            self._raise_key_validation(missing, invalid)
+        staged_keys: Path | None = None
+        validation: dict[str, int] = {}
+        if missing or invalid:
+            descriptor, temporary = tempfile.mkstemp(
+                prefix="keys-pending-",
+                suffix=".json",
+                dir=self.paths.root,
             )
-        if missing:
+            os.close(descriptor)
+            staged_keys = Path(temporary)
             try:
-                self.key_scanner(str(self.db_dir), str(self.paths.keys))
+                self.key_scanner(str(self.db_dir), str(staged_keys))
             except Exception as exc:
+                staged_keys.unlink(missing_ok=True)
                 message = str(exc)
                 status = "wechat_not_running" if "未运行" in message or "not running" in message.casefold() else "keys_missing"
                 raise ReaderUnavailableError(
-                    "WeChat database keys are unavailable. Keep desktop WeChat signed in and retry. "
-                    f"Key refresh failed: {exc}",
+                    f"Key refresh failed ({type(exc).__name__}); no existing keys were replaced.",
                     status=status,
                 ) from exc
-            keys = _read_json(self.paths.keys)
-            missing = [
-                path
-                for path in databases
-                if get_key_info(keys, _normalize_rel(path, self.db_dir)) is None
-            ]
-            if missing:
-                names = ", ".join(_normalize_rel(path, self.db_dir) for path in missing[:5])
-                raise ReaderUnavailableError(
-                    f"Missing decryption keys for: {names}",
-                    status="keys_missing",
-                )
+        try:
+            if staged_keys is not None:
+                keys = _read_json(staged_keys)
+                missing, invalid = self._validate_keys(databases, keys)
+                if missing or invalid:
+                    self._raise_key_validation(missing, invalid)
+            if allow_key_scan:
+                validation = self.validate_databases(databases, keys)
+            if staged_keys is not None:
+                staged_keys.replace(self.paths.keys)
+        finally:
+            if staged_keys is not None:
+                staged_keys.unlink(missing_ok=True)
 
         signature = source_signature(databases)
         keys_signature = hashlib.sha256(
             json.dumps(keys, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
+        account_cache = hashlib.sha256(
+            (os.path.normcase(str(self.db_dir)) + "\0" + keys_signature).encode("utf-8")
+        ).hexdigest()[:24]
         reader_config_key = (
             str(self.db_dir),
             str(self.paths.keys),
-            str(self.paths.decrypted),
-            str(self.paths.decoded_images),
-            str(self.paths.cache),
+            str(self.paths.decrypted / account_cache),
+            str(self.paths.decoded_images / account_cache),
+            str(self.paths.cache / account_cache),
         )
         source_changed = signature != self._last_signature
         keys_changed = keys_signature != self._reader_keys_signature
@@ -415,8 +444,6 @@ class LocalHistoryBackend:
                 "The cached WeChat keys do not match this database path. Reinitialize this account.",
                 status="key_mismatch",
             ) from exc
-        if allow_discovery:
-            RuntimeState(self.paths.root).save_db_dir(self.db_dir)
 
         if first_configuration or source_changed or keys_changed:
             self._clear_query_metadata_caches(
@@ -431,11 +458,75 @@ class LocalHistoryBackend:
             "source_changed": source_changed,
             "source_signature": signature,
             "database_count": len(databases),
+            "key_validated_count": len(databases),
+            **validation,
             "cache_status": "refreshed",
             "cache_age_seconds": 0.0,
             "refresh_reason": "forced" if force else "expired_or_initial",
         }
         return dict(self._snapshot)
+
+    def _validate_keys(self, databases: list[Path], keys: dict[str, Any]) -> tuple[int, int]:
+        missing = invalid = 0
+        for index, path in enumerate(databases, 1):
+            info = get_key_info(keys, _normalize_rel(path, self.db_dir))
+            if info is None:
+                missing += 1
+                continue
+            try:
+                enc_key = bytes.fromhex(info["enc_key"])
+                if len(enc_key) != 32:
+                    raise ValueError("invalid key length")
+            except (ValueError, TypeError, KeyError):
+                invalid += 1
+                continue
+            try:
+                with path.open("rb") as handle:
+                    first_page = handle.read(PAGE_SZ)
+            except OSError as exc:
+                raise ReaderUnavailableError(
+                    f"Database {index} could not be read during key validation ({type(exc).__name__}).",
+                    status="database_unavailable",
+                ) from exc
+            if len(first_page) != PAGE_SZ or not verify_enc_key(enc_key, first_page):
+                invalid += 1
+        return missing, invalid
+
+    @staticmethod
+    def _raise_key_validation(missing: int, invalid: int) -> None:
+        raise ReaderUnavailableError(
+            f"Database key validation failed: missing={missing}, invalid={invalid}. Reinitialize this account.",
+            status="key_mismatch" if invalid else "keys_missing",
+        )
+
+    def validate_databases(self, databases: list[Path], keys: dict[str, Any]) -> dict[str, int]:
+        """Prove fresh decryption opens as SQLite without querying chat rows."""
+        opened = 0
+        with tempfile.TemporaryDirectory(prefix="validate-", dir=self.paths.root) as temporary:
+            for index, path in enumerate(databases, 1):
+                destination = Path(temporary) / f"database-{index}.db"
+                info = get_key_info(keys, _normalize_rel(path, self.db_dir))
+                try:
+                    legacy_reader.full_decrypt(
+                        str(path),
+                        str(destination),
+                        bytes.fromhex(info["enc_key"]),
+                    )
+                    with closing(
+                        sqlite3.connect(destination.resolve().as_uri() + "?mode=ro", uri=True)
+                    ) as connection:
+                        connection.execute("PRAGMA schema_version").fetchone()
+                        connection.execute("SELECT count(*) FROM sqlite_schema").fetchone()
+                    opened += 1
+                except (OSError, ValueError, sqlite3.Error) as exc:
+                    code = getattr(exc, "sqlite_errorcode", None)
+                    raise ReaderUnavailableError(
+                        f"Database {index} failed fresh SQLite validation ({type(exc).__name__}, sqlite_code={code}).",
+                        status="database_open_failed",
+                    ) from exc
+                finally:
+                    destination.unlink(missing_ok=True)
+        return {"database_opened_count": opened}
 
     def _refresh_reader_metadata(self) -> None:
         refresh = getattr(self.reader, "refresh_reader", None)

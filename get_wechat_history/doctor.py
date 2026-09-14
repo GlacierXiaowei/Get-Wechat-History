@@ -55,7 +55,8 @@ class HistoryDoctor:
         }
 
     def check(self) -> dict[str, Any]:
-        configured = self.state.load().db_dir.strip()
+        configuration = self.state.load()
+        configured = (configuration.db_dir or configuration.pending_db_dir).strip()
         if not configured:
             return self._response(
                 "configuration_missing",

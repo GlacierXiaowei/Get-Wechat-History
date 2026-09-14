@@ -1,6 +1,6 @@
 {
   "name": "get-wechat-history",
-  "version": "0.3.0+codex.20260825122512",
+  "version": "1.1.0",
   "description": "Search, read, and export local WeChat history through a read-only MCP server with bounded freshness caching.",
   "author": {
     "name": "Glacier Xiaowei"
